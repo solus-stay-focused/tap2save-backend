@@ -137,10 +137,13 @@ function fetchMetadata(url) {
 }
 
 function simplifyFormats(rawFormats = []) {
-  // Keep only formats that are actually downloadable and useful to show,
-  // collapse to a friendly shape, and dedupe by resolution+ext.
-  const seen = new Set();
-  const formats = [];
+  // YouTube (and others) serve the *same* resolution in multiple codecs
+  // (av1/vp9/h264), which used to show up as several near-identical rows
+  // like "1080p (94MB)" and "1080p (40MB)". Instead: bucket by resolution,
+  // keep only the single best variant per bucket, and offer one clean
+  // audio (MP3) option - same short list style as most downloader sites.
+  const videoByHeight = new Map();
+  const audioCandidates = [];
 
   for (const f of rawFormats) {
     if (!f.url) continue; // skip formats yt-dlp can't hand us a direct URL for
@@ -148,40 +151,72 @@ function simplifyFormats(rawFormats = []) {
     const hasAudio = f.acodec && f.acodec !== 'none';
     if (!hasVideo && !hasAudio) continue;
 
-    const label = hasVideo
-      ? `${f.height ? f.height + 'p' : f.format_note || 'video'}${f.fps ? ` ${f.fps}fps` : ''}`
-      : `Audio ${f.abr ? Math.round(f.abr) + 'kbps' : ''}`.trim();
+    if (hasVideo) {
+      const height = f.height || 0;
+      if (!height) continue; // skip formats with no usable resolution info
 
-    const key = `${label}-${f.ext}-${hasVideo}-${hasAudio}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+      // Prefer higher bitrate, higher fps, and widely-compatible h264/avc1
+      const score =
+        (f.tbr || 0) +
+        (f.fps && f.fps > 30 ? 500 : 0) +
+        (f.vcodec && f.vcodec.startsWith('avc1') ? 250 : 0);
 
-    // Many adaptive formats (esp. YouTube 720p+) ship video-only, with
-    // audio as a separate track. If we handed the raw format_id straight
-    // to the download step, yt-dlp would fetch video with no sound. Bake
-    // the merge selector in now so /api/download always gets audio.
-    const downloadSelector =
-      hasVideo && !hasAudio ? `${f.format_id}+bestaudio/best` : f.format_id;
-
-    formats.push({
-      formatId: downloadSelector,
-      label,
-      ext: f.ext,
-      kind: hasVideo ? 'video' : 'audio',
-      hasAudio: hasVideo ? true : hasAudio, // true post-merge for video entries
-      width: f.width || null,
-      height: f.height || null,
-      filesize: f.filesize || f.filesize_approx || null,
-    });
+      const existing = videoByHeight.get(height);
+      if (!existing || score > existing._score) {
+        videoByHeight.set(height, { ...f, _score: score });
+      }
+    } else {
+      audioCandidates.push(f);
+    }
   }
 
-  // Sort video formats tallest first, audio formats highest bitrate first
-  formats.sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === 'video' ? -1 : 1;
-    return (b.height || 0) - (a.height || 0);
-  });
+  const videoFormats = Array.from(videoByHeight.values())
+    .sort((a, b) => b.height - a.height)
+    .slice(0, 6) // top 6 resolutions is plenty; avoids an endless list
+    .map((f) => {
+      const label =
+        f.height >= 2160
+          ? `4K (${f.height}p)`
+          : `${f.height}p${f.fps && f.fps > 30 ? ` ${f.fps}fps` : ''}`;
 
-  return formats;
+      // Video-only streams still need an audio track merged in at
+      // download time; combined streams can be fetched as-is.
+      const downloadSelector =
+        f.acodec && f.acodec !== 'none' ? f.format_id : `${f.format_id}+bestaudio/best`;
+
+      return {
+        formatId: downloadSelector,
+        label,
+        ext: 'mp4',
+        kind: 'video',
+        hasAudio: true,
+        width: f.width || null,
+        height: f.height || null,
+        filesize: f.filesize || f.filesize_approx || null,
+      };
+    });
+
+  // One clean audio option, converted to MP3 at download time regardless
+  // of the source codec (opus/m4a/etc) - so we only ever show a single
+  // "MP3 Audio" row instead of several raw-codec/bitrate variants.
+  audioCandidates.sort((a, b) => (b.abr || 0) - (a.abr || 0));
+  const bestAudio = audioCandidates[0];
+  const audioFormats = bestAudio
+    ? [
+        {
+          formatId: bestAudio.format_id,
+          label: 'MP3 Audio',
+          ext: 'mp3',
+          kind: 'audio',
+          hasAudio: true,
+          width: null,
+          height: null,
+          filesize: bestAudio.filesize || bestAudio.filesize_approx || null,
+        },
+      ]
+    : [];
+
+  return [...videoFormats, ...audioFormats];
 }
 
 // ---------------------------------------------------------------------
