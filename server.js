@@ -34,9 +34,6 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 8787;
@@ -319,32 +316,29 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     ff.on('error', () => { cleanup(yt, ff); if (!res.headersSent) res.sendStatus(500); });
     req.on('close', () => cleanup(yt, ff));
   } else {
-    // Video: when the requested format is video-only (the common case
-    // for anything above ~720p on YouTube), yt-dlp has to merge it with
-    // a separate audio track using ffmpeg. That merge needs a seekable
-    // output file to write the mp4 index (moov atom) - a stdout pipe to
-    // the browser is NOT seekable, so merging directly into "-o -" (the
-    // old approach here) silently drops audio. Instead: merge to a temp
-    // file on disk (seekable), then stream that finished file to the
-    // client and delete it afterward.
-    const tmpDir = os.tmpdir();
-    const tmpBase = path.join(tmpDir, `t2s_${crypto.randomUUID()}`);
-    const outTemplate = `${tmpBase}.%(ext)s`;
-
+    // Video: yt-dlp downloads video+audio, merges them with ffmpeg, and
+    // streams the result straight to the browser as it's produced - no
+    // waiting for a full file to finish writing to disk first.
+    //
+    // Two things had to be true at once to make this safe:
+    //  1. Audio must always be AAC (not copied as-is), because YouTube's
+    //     separate audio track is usually Opus, and most standard video
+    //     players can't decode Opus inside mp4 - only ffmpeg-based apps
+    //     (Clipchamp, VLC) can. So we force -c:a aac.
+    //  2. A plain mp4 mux needs to SEEK BACK at the end to write its
+    //     index (the "moov atom") - impossible on a stdout pipe. Without
+    //     handling this, ffmpeg either fails or drops the audio track
+    //     entirely on a pipe. The fix is fragmented mp4
+    //     (frag_keyframe+empty_moov), which writes the index incrementally
+    //     instead of seeking back, so it works perfectly over a pipe -
+    //     the resulting file is still a completely standard, fully
+    //     playable mp4 once downloaded.
     const ytArgs = [
       '-f', formatId || 'bv*+ba/b',
       '--merge-output-format', 'mp4',
-      // Always transcode the audio track to AAC on merge. YouTube's
-      // separate audio-only stream is usually Opus; mp4 can technically
-      // hold Opus and ffmpeg-based apps (Clipchamp, VLC, etc.) will
-      // still play it fine, but most standard/native video players
-      // (Windows Movies & TV, many phone gallery players, some smart
-      // TVs) only decode AAC audio inside mp4 and will play the file
-      // completely silent. Re-encoding here guarantees the file works
-      // everywhere. Video stream is left untouched (-c:v copy) so this
-      // adds negligible time/quality loss.
-      '--postprocessor-args', 'Merger:-c:v copy -c:a aac -b:a 192k',
-      '-o', outTemplate,
+      '--postprocessor-args',
+      'Merger:-c:v copy -c:a aac -b:a 192k -movflags frag_keyframe+empty_moov+default_base_moof',
+      '-o', '-',
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificates',
@@ -352,64 +346,29 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     ];
 
     const yt = spawn(YTDLP_PATH, ytArgs);
-    let stderrBuf = '';
+    let stderrTail = '';
 
-    const cleanupTempFiles = () => {
-      try {
-        for (const f of fs.readdirSync(tmpDir)) {
-          if (f.startsWith(path.basename(tmpBase))) {
-            fs.unlink(path.join(tmpDir, f), () => {});
-          }
-        }
-      } catch { /* best effort */ }
-    };
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp4"`);
 
+    yt.stdout.pipe(res);
     yt.stderr.on('data', (d) => {
       const s = d.toString();
-      stderrBuf += s;
+      stderrTail = (stderrTail + s).slice(-4000);
       console.error('[yt-dlp]', s);
     });
-
     yt.on('error', (err) => {
       cleanup(yt);
-      cleanupTempFiles();
       if (!res.headersSent) res.status(500).json({ error: 'Failed to start yt-dlp.', detail: err.message });
     });
-
-    req.on('close', () => { if (!res.writableEnded) cleanup(yt); });
-
     yt.on('exit', (code) => {
-      if (killed) return; // client already disconnected
-      if (code !== 0) {
-        cleanupTempFiles();
-        if (!res.headersSent) {
-          const msg = stderrBuf.split('\n').filter(Boolean).pop() || 'yt-dlp exited with an error.';
-          res.status(502).json({ error: 'Download failed.', detail: msg });
-        }
-        return;
+      if (killed) return;
+      if (code !== 0 && !res.headersSent) {
+        const msg = stderrTail.split('\n').filter(Boolean).pop() || 'yt-dlp exited with an error.';
+        res.status(502).json({ error: 'Download failed.', detail: msg });
       }
-
-      // yt-dlp finishes the mp4 named exactly `${tmpBase}.mp4` because we
-      // forced --merge-output-format mp4 above.
-      const finalPath = `${tmpBase}.mp4`;
-
-      fs.stat(finalPath, (statErr, stats) => {
-        if (statErr) {
-          cleanupTempFiles();
-          if (!res.headersSent) res.status(502).json({ error: 'Merged file was not found after download.' });
-          return;
-        }
-
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp4"`);
-        res.setHeader('Content-Length', stats.size);
-
-        const readStream = fs.createReadStream(finalPath);
-        readStream.pipe(res);
-        readStream.on('error', () => { if (!res.headersSent) res.sendStatus(500); });
-        readStream.on('close', cleanupTempFiles);
-      });
     });
+    req.on('close', () => cleanup(yt));
   }
 });
 
