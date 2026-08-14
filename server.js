@@ -34,6 +34,9 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 8787;
@@ -42,6 +45,36 @@ const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
   .split(',')
   .map((s) => s.trim());
+
+// ---------------------------------------------------------------------
+// YouTube cookies (fixes "Sign in to confirm you're not a bot")
+// ---------------------------------------------------------------------
+// YouTube increasingly blocks anonymous/datacenter IPs (which is exactly
+// what a Railway box looks like to them) unless yt-dlp presents cookies
+// from a real, logged-in browser session. Set the env var
+// YTDLP_COOKIES_B64 to the base64-encoded contents of a cookies.txt file
+// (Netscape format) exported from your own browser, and this decodes it
+// once at boot into a temp file that every yt-dlp call below points to.
+// If the env var isn't set, yt-dlp just runs without cookies as before.
+let COOKIES_FILE_PATH = null;
+if (process.env.YTDLP_COOKIES_B64) {
+  try {
+    const decoded = Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8');
+    COOKIES_FILE_PATH = path.join(os.tmpdir(), 'yt-dlp-cookies.txt');
+    fs.writeFileSync(COOKIES_FILE_PATH, decoded, { mode: 0o600 });
+    console.log('[startup] Loaded YouTube cookies from YTDLP_COOKIES_B64.');
+  } catch (err) {
+    console.error('[startup] Failed to decode YTDLP_COOKIES_B64:', err.message);
+    COOKIES_FILE_PATH = null;
+  }
+} else {
+  console.warn('[startup] YTDLP_COOKIES_B64 not set - YouTube requests may be blocked with "Sign in to confirm you\'re not a bot".');
+}
+
+// Helper: prepend --cookies <path> to a yt-dlp args array when available.
+function withCookies(args) {
+  return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...args] : args;
+}
 
 app.use(express.json({ limit: '32kb' }));
 app.use(
@@ -119,7 +152,7 @@ function fetchMetadata(url) {
 
     execFile(
       YTDLP_PATH,
-      args,
+      withCookies(args),
       { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
@@ -300,7 +333,7 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     ];
     const ffArgs = ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-acodec', 'libmp3lame', '-q:a', '2', '-f', 'mp3', 'pipe:1'];
 
-    const yt = spawn(YTDLP_PATH, ytArgs);
+    const yt = spawn(YTDLP_PATH, withCookies(ytArgs));
     const ff = spawn(FFMPEG_PATH, ffArgs);
 
     res.setHeader('Content-Type', 'audio/mpeg');
@@ -345,7 +378,7 @@ app.get('/api/download', downloadLimiter, (req, res) => {
       url,
     ];
 
-    const yt = spawn(YTDLP_PATH, ytArgs);
+    const yt = spawn(YTDLP_PATH, withCookies(ytArgs));
     let stderrTail = '';
 
     res.setHeader('Content-Type', 'video/mp4');
