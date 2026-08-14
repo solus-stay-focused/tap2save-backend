@@ -71,9 +71,15 @@ if (process.env.YTDLP_COOKIES_B64) {
   console.warn('[startup] YTDLP_COOKIES_B64 not set - YouTube requests may be blocked with "Sign in to confirm you\'re not a bot".');
 }
 
-// Helper: prepend --cookies <path> to a yt-dlp args array when available.
+// Helper: prepend --cookies <path> and a player-client fallback to a
+// yt-dlp args array. YouTube has been requiring extra verification
+// (a "PO token") for its default web client; the "tv" client generally
+// still works without one and pairs well with cookies. Combining both
+// is currently the most reliable combo the yt-dlp community has found.
 function withCookies(args) {
-  return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...args] : args;
+  const extra = ['--extractor-args', 'youtube:player_client=tv,web'];
+  const withClient = [...extra, ...args];
+  return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
 }
 
 app.use(express.json({ limit: '32kb' }));
