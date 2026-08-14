@@ -156,12 +156,19 @@ function simplifyFormats(rawFormats = []) {
     if (seen.has(key)) continue;
     seen.add(key);
 
+    // Many adaptive formats (esp. YouTube 720p+) ship video-only, with
+    // audio as a separate track. If we handed the raw format_id straight
+    // to the download step, yt-dlp would fetch video with no sound. Bake
+    // the merge selector in now so /api/download always gets audio.
+    const downloadSelector =
+      hasVideo && !hasAudio ? `${f.format_id}+bestaudio/best` : f.format_id;
+
     formats.push({
-      formatId: f.format_id,
+      formatId: downloadSelector,
       label,
       ext: f.ext,
       kind: hasVideo ? 'video' : 'audio',
-      hasAudio,
+      hasAudio: hasVideo ? true : hasAudio, // true post-merge for video entries
       width: f.width || null,
       height: f.height || null,
       filesize: f.filesize || f.filesize_approx || null,
