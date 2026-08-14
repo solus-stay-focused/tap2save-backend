@@ -334,6 +334,16 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     const ytArgs = [
       '-f', formatId || 'bv*+ba/b',
       '--merge-output-format', 'mp4',
+      // Always transcode the audio track to AAC on merge. YouTube's
+      // separate audio-only stream is usually Opus; mp4 can technically
+      // hold Opus and ffmpeg-based apps (Clipchamp, VLC, etc.) will
+      // still play it fine, but most standard/native video players
+      // (Windows Movies & TV, many phone gallery players, some smart
+      // TVs) only decode AAC audio inside mp4 and will play the file
+      // completely silent. Re-encoding here guarantees the file works
+      // everywhere. Video stream is left untouched (-c:v copy) so this
+      // adds negligible time/quality loss.
+      '--postprocessor-args', 'Merger:-c:v copy -c:a aac -b:a 192k',
       '-o', outTemplate,
       '--no-playlist',
       '--no-warnings',
