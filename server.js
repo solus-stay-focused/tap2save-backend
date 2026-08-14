@@ -34,6 +34,9 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 8787;
@@ -316,12 +319,22 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     ff.on('error', () => { cleanup(yt, ff); if (!res.headersSent) res.sendStatus(500); });
     req.on('close', () => cleanup(yt, ff));
   } else {
-    // Video: let yt-dlp select/merge the requested format and write
-    // straight to stdout as mp4.
+    // Video: when the requested format is video-only (the common case
+    // for anything above ~720p on YouTube), yt-dlp has to merge it with
+    // a separate audio track using ffmpeg. That merge needs a seekable
+    // output file to write the mp4 index (moov atom) - a stdout pipe to
+    // the browser is NOT seekable, so merging directly into "-o -" (the
+    // old approach here) silently drops audio. Instead: merge to a temp
+    // file on disk (seekable), then stream that finished file to the
+    // client and delete it afterward.
+    const tmpDir = os.tmpdir();
+    const tmpBase = path.join(tmpDir, `t2s_${crypto.randomUUID()}`);
+    const outTemplate = `${tmpBase}.%(ext)s`;
+
     const ytArgs = [
       '-f', formatId || 'bv*+ba/b',
       '--merge-output-format', 'mp4',
-      '-o', '-',
+      '-o', outTemplate,
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificates',
@@ -329,14 +342,64 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     ];
 
     const yt = spawn(YTDLP_PATH, ytArgs);
+    let stderrBuf = '';
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp4"`);
+    const cleanupTempFiles = () => {
+      try {
+        for (const f of fs.readdirSync(tmpDir)) {
+          if (f.startsWith(path.basename(tmpBase))) {
+            fs.unlink(path.join(tmpDir, f), () => {});
+          }
+        }
+      } catch { /* best effort */ }
+    };
 
-    yt.stdout.pipe(res);
-    yt.stderr.on('data', (d) => console.error('[yt-dlp]', d.toString()));
-    yt.on('error', () => { cleanup(yt); if (!res.headersSent) res.sendStatus(500); });
-    req.on('close', () => cleanup(yt));
+    yt.stderr.on('data', (d) => {
+      const s = d.toString();
+      stderrBuf += s;
+      console.error('[yt-dlp]', s);
+    });
+
+    yt.on('error', (err) => {
+      cleanup(yt);
+      cleanupTempFiles();
+      if (!res.headersSent) res.status(500).json({ error: 'Failed to start yt-dlp.', detail: err.message });
+    });
+
+    req.on('close', () => { if (!res.writableEnded) cleanup(yt); });
+
+    yt.on('exit', (code) => {
+      if (killed) return; // client already disconnected
+      if (code !== 0) {
+        cleanupTempFiles();
+        if (!res.headersSent) {
+          const msg = stderrBuf.split('\n').filter(Boolean).pop() || 'yt-dlp exited with an error.';
+          res.status(502).json({ error: 'Download failed.', detail: msg });
+        }
+        return;
+      }
+
+      // yt-dlp finishes the mp4 named exactly `${tmpBase}.mp4` because we
+      // forced --merge-output-format mp4 above.
+      const finalPath = `${tmpBase}.mp4`;
+
+      fs.stat(finalPath, (statErr, stats) => {
+        if (statErr) {
+          cleanupTempFiles();
+          if (!res.headersSent) res.status(502).json({ error: 'Merged file was not found after download.' });
+          return;
+        }
+
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp4"`);
+        res.setHeader('Content-Length', stats.size);
+
+        const readStream = fs.createReadStream(finalPath);
+        readStream.pipe(res);
+        readStream.on('error', () => { if (!res.headersSent) res.sendStatus(500); });
+        readStream.on('close', cleanupTempFiles);
+      });
+    });
   }
 });
 
