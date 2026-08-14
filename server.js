@@ -77,7 +77,7 @@ if (process.env.YTDLP_COOKIES_B64) {
 // still works without one and pairs well with cookies. Combining both
 // is currently the most reliable combo the yt-dlp community has found.
 function withCookies(args) {
-  const extra = ['--extractor-args', 'youtube:player_client=tv,web'];
+  const extra = ['--extractor-args', 'youtube:player_client=web,tv'];
   const withClient = [...extra, ...args];
   return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
 }
