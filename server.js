@@ -86,14 +86,13 @@ function withCookies(args) {
   // stream (itag 18, the one format that's never required a PO token)
   // shows up, which is why only one quality was appearing.
   const extra = [
+    // YouTube has been forcing "SABR streaming" on more clients this
+    // year, which strips the direct download URL from formats unless
+    // yt-dlp can solve a JS challenge it presents first. --remote-components
+    // downloads yt-dlp's own JS-challenge solver on demand so this keeps
+    // working without us having to install a separate JS runtime.
+    '--remote-components', 'ejs:github',
     '--extractor-args',
-    // Trying more client "personas" than just android/tv/web. YouTube has
-    // been rolling out server-side changes (SABR streaming) that strip
-    // download URLs from some clients' formats without warning - when
-    // that happens to whichever client yt-dlp tries first, it can end up
-    // with zero usable formats and throw "Requested format is not
-    // available" even during a plain info lookup. Listing more clients
-    // gives yt-dlp more chances to find one YouTube hasn't restricted yet.
     'youtube:player_client=android,tv,ios,mweb,web;formats=missing_pot',
   ];
   const withClient = [...extra, ...args];
