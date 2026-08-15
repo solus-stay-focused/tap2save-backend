@@ -77,7 +77,18 @@ if (process.env.YTDLP_COOKIES_B64) {
 // still works without one and pairs well with cookies. Combining both
 // is currently the most reliable combo the yt-dlp community has found.
 function withCookies(args) {
-  const extra = ['--extractor-args', 'youtube:player_client=android,tv,web'];
+  // "formats=missing_pot" tells yt-dlp to include the higher-quality
+  // (720p/1080p/4K) adaptive formats even though YouTube now gates them
+  // behind a PO token we're not generating. yt-dlp normally hides these
+  // because they can 403 for anonymous requests - but since we're
+  // authenticating with real account cookies, YouTube usually still
+  // serves them fine. Without this flag only the legacy pre-muxed 360p
+  // stream (itag 18, the one format that's never required a PO token)
+  // shows up, which is why only one quality was appearing.
+  const extra = [
+    '--extractor-args',
+    'youtube:player_client=android,tv,web;formats=missing_pot',
+  ];
   const withClient = [...extra, ...args];
   return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
 }
