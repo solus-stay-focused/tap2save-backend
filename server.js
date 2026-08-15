@@ -87,7 +87,14 @@ function withCookies(args) {
   // shows up, which is why only one quality was appearing.
   const extra = [
     '--extractor-args',
-    'youtube:player_client=android,tv,web;formats=missing_pot',
+    // Trying more client "personas" than just android/tv/web. YouTube has
+    // been rolling out server-side changes (SABR streaming) that strip
+    // download URLs from some clients' formats without warning - when
+    // that happens to whichever client yt-dlp tries first, it can end up
+    // with zero usable formats and throw "Requested format is not
+    // available" even during a plain info lookup. Listing more clients
+    // gives yt-dlp more chances to find one YouTube hasn't restricted yet.
+    'youtube:player_client=android,tv,ios,mweb,web;formats=missing_pot',
   ];
   const withClient = [...extra, ...args];
   return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
@@ -160,6 +167,11 @@ function fetchMetadata(url) {
   return new Promise((resolve, reject) => {
     const args = [
       '--dump-single-json',
+      // Explicit fallback selector: try to combine the best separate
+      // video+audio streams, but if none survive YouTube's format
+      // restrictions, fall back to whatever single combined stream IS
+      // playable rather than erroring out with nothing at all.
+      '-f', 'bv*+ba/b',
       '--no-warnings',
       '--no-playlist',
       '--no-check-certificates',
