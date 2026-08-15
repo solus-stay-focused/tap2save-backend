@@ -39,6 +39,14 @@ const os = require('os');
 const path = require('path');
 
 const app = express();
+
+// Railway sits in front of this app as a reverse proxy, so every request
+// arrives with an X-Forwarded-For header. Express's rate limiter refuses
+// to trust that header (to prevent IP spoofing) unless we explicitly say
+// this app IS behind a trusted proxy - without this line, requests were
+// crashing with ValidationError: ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 8787;
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
