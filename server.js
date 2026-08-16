@@ -92,6 +92,9 @@ function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
   // stream (itag 18, the one format that's never required a PO token)
   // shows up, which is why only one quality was appearing.
   const extra = [
+    '--no-cache-dir', // avoids yt-dlp replaying a stale cached failure/format
+                       // result for a video ID it tried earlier under
+                       // different auth/client conditions
     '--extractor-args',
     `youtube:player_client=${playerClients};formats=missing_pot`,
   ];
@@ -192,7 +195,9 @@ async function fetchMetadata(url) {
         { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 },
         (err, stdout, stderr) => {
           if (err) {
-            const msg = stderr?.toString().split('\n').filter(Boolean).pop() || err.message;
+            const full = stderr?.toString().trim();
+            console.error('[fetchMetadata] yt-dlp stderr (full):\n' + full);
+            const msg = full?.split('\n').filter(Boolean).pop() || err.message;
             return reject(new Error(msg));
           }
           try {
