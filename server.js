@@ -39,20 +39,15 @@ const os = require('os');
 const path = require('path');
 
 const app = express();
-
-// Railway sits in front of this app as a reverse proxy, so every request
-// arrives with an X-Forwarded-For header. Express's rate limiter refuses
-// to trust that header (to prevent IP spoofing) unless we explicitly say
-// this app IS behind a trusted proxy - without this line, requests were
-// crashing with ValidationError: ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
-app.set('trust proxy', 1);
-
 const PORT = process.env.PORT || 8787;
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
   .split(',')
   .map((s) => s.trim());
+
+// Only offer/allow qualities at or below 1080p (no 1440p/4K etc).
+const MAX_VIDEO_HEIGHT = 1080;
 
 // ---------------------------------------------------------------------
 // YouTube cookies (fixes "Sign in to confirm you're not a bot")
@@ -94,14 +89,8 @@ function withCookies(args) {
   // stream (itag 18, the one format that's never required a PO token)
   // shows up, which is why only one quality was appearing.
   const extra = [
-    // YouTube has been forcing "SABR streaming" on more clients this
-    // year, which strips the direct download URL from formats unless
-    // yt-dlp can solve a JS challenge it presents first. --remote-components
-    // downloads yt-dlp's own JS-challenge solver on demand so this keeps
-    // working without us having to install a separate JS runtime.
-    '--remote-components', 'ejs:github',
     '--extractor-args',
-    'youtube:player_client=android,tv,ios,mweb,web;formats=missing_pot',
+    'youtube:player_client=android,tv,web;formats=missing_pot',
   ];
   const withClient = [...extra, ...args];
   return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
@@ -174,11 +163,6 @@ function fetchMetadata(url) {
   return new Promise((resolve, reject) => {
     const args = [
       '--dump-single-json',
-      // Explicit fallback selector: try to combine the best separate
-      // video+audio streams, but if none survive YouTube's format
-      // restrictions, fall back to whatever single combined stream IS
-      // playable rather than erroring out with nothing at all.
-      '-f', 'bv*+ba/b',
       '--no-warnings',
       '--no-playlist',
       '--no-check-certificates',
@@ -223,6 +207,7 @@ function simplifyFormats(rawFormats = []) {
     if (hasVideo) {
       const height = f.height || 0;
       if (!height) continue; // skip formats with no usable resolution info
+      if (height > MAX_VIDEO_HEIGHT) continue; // cap: never offer above 1080p
 
       // Prefer higher bitrate, higher fps, and widely-compatible h264/avc1
       const score =
@@ -403,7 +388,7 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     //     the resulting file is still a completely standard, fully
     //     playable mp4 once downloaded.
     const ytArgs = [
-      '-f', formatId || 'bv*+ba/b',
+      '-f', formatId || `bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`,
       '--merge-output-format', 'mp4',
       '--postprocessor-args',
       'Merger:-c:v copy -c:a aac -b:a 192k -movflags frag_keyframe+empty_moov+default_base_moof',
