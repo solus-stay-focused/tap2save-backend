@@ -82,7 +82,7 @@ if (process.env.YTDLP_COOKIES_B64) {
 // (a "PO token") for its default web client; the "tv" client generally
 // still works without one and pairs well with cookies. Combining both
 // is currently the most reliable combo the yt-dlp community has found.
-function withCookies(args) {
+function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
   // "formats=missing_pot" tells yt-dlp to include the higher-quality
   // (720p/1080p/4K) adaptive formats even though YouTube now gates them
   // behind a PO token we're not generating. yt-dlp normally hides these
@@ -93,11 +93,23 @@ function withCookies(args) {
   // shows up, which is why only one quality was appearing.
   const extra = [
     '--extractor-args',
-    'youtube:player_client=android,tv,web;formats=missing_pot',
+    `youtube:player_client=${playerClients};formats=missing_pot`,
   ];
   const withClient = [...extra, ...args];
   return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
 }
+
+// Different player-client combos succeed/fail on a per-video basis
+// (age-restricted, members-only, or livestream/premiere content in
+// particular can reject one combo but work fine with another). Try the
+// normal combo first, then fall back to progressively different ones
+// instead of failing the whole request after a single attempt.
+const CLIENT_FALLBACKS = [
+  'android,tv,web',
+  'tv,web',
+  'web',
+  'ios',
+];
 
 app.use(express.json({ limit: '32kb' }));
 app.use(
@@ -162,34 +174,48 @@ function detectPlatform(rawUrl) {
 // ---------------------------------------------------------------------
 // Helper: run `yt-dlp --dump-single-json <url>` and parse the result
 // ---------------------------------------------------------------------
-function fetchMetadata(url) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '--dump-single-json',
-      '--no-warnings',
-      '--no-playlist',
-      '--no-check-certificates',
-      '--socket-timeout', '20',
-      url,
-    ];
+async function fetchMetadata(url) {
+  const args = [
+    '--dump-single-json',
+    '--no-warnings',
+    '--no-playlist',
+    '--no-check-certificates',
+    '--socket-timeout', '20',
+    url,
+  ];
 
-    execFile(
-      YTDLP_PATH,
-      withCookies(args),
-      { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (err) {
-          const msg = stderr?.toString().split('\n').filter(Boolean).pop() || err.message;
-          return reject(new Error(msg));
+  const tryClient = (playerClients) =>
+    new Promise((resolve, reject) => {
+      execFile(
+        YTDLP_PATH,
+        withCookies(args, playerClients),
+        { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) {
+            const msg = stderr?.toString().split('\n').filter(Boolean).pop() || err.message;
+            return reject(new Error(msg));
+          }
+          try {
+            resolve(JSON.parse(stdout));
+          } catch (parseErr) {
+            reject(new Error('Failed to parse yt-dlp output'));
+          }
         }
-        try {
-          resolve(JSON.parse(stdout));
-        } catch (parseErr) {
-          reject(new Error('Failed to parse yt-dlp output'));
-        }
-      }
-    );
-  });
+      );
+    });
+
+  // Try each player-client combo in turn; only give up once they've all
+  // failed. Age-restricted/members-only/livestream videos in particular
+  // can reject one combo but resolve fine with another.
+  let lastErr;
+  for (const clients of CLIENT_FALLBACKS) {
+    try {
+      return await tryClient(clients);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 function simplifyFormats(rawFormats = []) {
