@@ -82,7 +82,7 @@ if (process.env.YTDLP_COOKIES_B64) {
 // (a "PO token") for its default web client; the "tv" client generally
 // still works without one and pairs well with cookies. Combining both
 // is currently the most reliable combo the yt-dlp community has found.
-function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
+function withCookies(args, playerClients = CLIENT_FALLBACKS[0], useCookies = true) {
   // "formats=missing_pot" tells yt-dlp to include the higher-quality
   // (720p/1080p/4K) adaptive formats even though YouTube now gates them
   // behind a PO token we're not generating. yt-dlp normally hides these
@@ -97,6 +97,13 @@ function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
   // only expose PO-token-gated formats that our cookies can't satisfy -
   // forcing formats=missing_pot on those returns zero usable formats no
   // matter which client we force. Plain mode is the final fallback.
+  //
+  // useCookies === false skips attaching cookies at all. Cookies carry
+  // your ENTIRE account state (Restricted Mode, age-verification status,
+  // account region, content settings) - not just "proof of a real
+  // browser". A video that's blocked *because of* those account-level
+  // settings can succeed as a plain anonymous request even though it
+  // fails every cookie-authenticated attempt.
   const extra = ['--no-cache-dir']; // avoids yt-dlp replaying a stale cached
                                      // failure/format result for a video ID
                                      // it tried earlier under different
@@ -105,7 +112,7 @@ function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
     extra.push('--extractor-args', `youtube:player_client=${playerClients};formats=missing_pot`);
   }
   const withClient = [...extra, ...args];
-  return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
+  return COOKIES_FILE_PATH && useCookies ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
 }
 
 // Different player-client combos succeed/fail on a per-video basis
@@ -113,7 +120,9 @@ function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
 // particular can reject one combo but work fine with another). Try the
 // normal combo first, then fall back to progressively different ones,
 // and finally try plain mode (null = no client/PO-token override at
-// all) before giving up entirely.
+// all) before giving up entirely. Each entry also gets tried once WITH
+// cookies and, if that fails, once WITHOUT - see CLIENT_FALLBACKS usage
+// in fetchMetadata().
 const CLIENT_FALLBACKS = [
   'android,tv,web',
   'tv,web',
@@ -195,16 +204,18 @@ async function fetchMetadata(url) {
     url,
   ];
 
-  const tryClient = (playerClients) =>
+  const tryClient = (playerClients, useCookies) =>
     new Promise((resolve, reject) => {
       execFile(
         YTDLP_PATH,
-        withCookies(args, playerClients),
+        withCookies(args, playerClients, useCookies),
         { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 },
         (err, stdout, stderr) => {
           if (err) {
             const full = stderr?.toString().trim();
-            console.error('[fetchMetadata] yt-dlp stderr (full):\n' + full);
+            console.error(
+              `[fetchMetadata] yt-dlp stderr (client=${playerClients}, cookies=${useCookies}, full):\n${full}`
+            );
             const msg = full?.split('\n').filter(Boolean).pop() || err.message;
             return reject(new Error(msg));
           }
@@ -217,15 +228,22 @@ async function fetchMetadata(url) {
       );
     });
 
-  // Try each player-client combo in turn; only give up once they've all
-  // failed. Age-restricted/members-only/livestream videos in particular
-  // can reject one combo but resolve fine with another.
+  // Try each player-client combo with cookies first (cookies help avoid
+  // bulk bot-detection blocking on most requests). If every cookie-based
+  // attempt fails, run through the same combos again with NO cookies at
+  // all - a video that's being blocked *because of* your account's
+  // Restricted Mode/age-verification/region settings can succeed as a
+  // plain anonymous request even though every cookie-authenticated
+  // attempt failed.
   let lastErr;
-  for (const clients of CLIENT_FALLBACKS) {
-    try {
-      return await tryClient(clients);
-    } catch (err) {
-      lastErr = err;
+  const cookiePasses = COOKIES_FILE_PATH ? [true, false] : [false];
+  for (const useCookies of cookiePasses) {
+    for (const clients of CLIENT_FALLBACKS) {
+      try {
+        return await tryClient(clients, useCookies);
+      } catch (err) {
+        lastErr = err;
+      }
     }
   }
   throw lastErr;
