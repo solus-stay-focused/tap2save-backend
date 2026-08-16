@@ -39,6 +39,9 @@ const os = require('os');
 const path = require('path');
 
 const app = express();
+app.set('trust proxy', 1); // Railway (and most PaaS) run behind a reverse proxy;
+// this lets express-rate-limit correctly read X-Forwarded-For instead of
+// throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every request.
 const PORT = process.env.PORT || 8787;
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
@@ -344,8 +347,12 @@ app.get('/api/download', downloadLimiter, (req, res) => {
 
   if (type === 'audio') {
     // yt-dlp -> stdout (best audio track) piped into ffmpeg -> mp3 -> stdout
+    // If a specific formatId was requested but is no longer resolvable
+    // (YouTube's available itags can shift between /api/info and the
+    // actual download), fall back to bestaudio instead of hard-failing.
+    const audioSelector = formatId ? `${formatId}/bestaudio/best` : 'bestaudio/best';
     const ytArgs = [
-      '-f', formatId || 'bestaudio/best',
+      '-f', audioSelector,
       '-o', '-',
       '--no-playlist',
       '--no-warnings',
@@ -387,8 +394,12 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     //     instead of seeking back, so it works perfectly over a pipe -
     //     the resulting file is still a completely standard, fully
     //     playable mp4 once downloaded.
+    // Same fallback idea as the audio branch: try the exact requested
+    // format first, then drop back to a safe <=1080p pick if it's gone.
+    const capSelector = `bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`;
+    const videoSelector = formatId ? `${formatId}/${capSelector}` : capSelector;
     const ytArgs = [
-      '-f', formatId || `bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`,
+      '-f', videoSelector,
       '--merge-output-format', 'mp4',
       '--postprocessor-args',
       'Merger:-c:v copy -c:a aac -b:a 192k -movflags frag_keyframe+empty_moov+default_base_moof',
