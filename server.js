@@ -378,12 +378,70 @@ app.post('/api/info', infoLimiter, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
+// Helper: find a client/cookie combo that can actually resolve a given
+// format selector for this URL, using `--get-url` (fast - just resolves
+// the direct media URL, doesn't download it). This is what fixes the
+// "0 bytes downloaded" bug: /api/info can succeed under one combo (e.g.
+// no cookies + ios client) while /api/download was hardcoded to always
+// use a different combo (cookies + android,tv,web) that doesn't resolve
+// this particular video - yt-dlp then exits with no output, and the
+// browser silently saves an empty file. Running this cheap check first
+// means the real (slow) download always uses a combo we've confirmed
+// actually works.
+// ---------------------------------------------------------------------
+function resolveWorkingCombo(url, formatSelector) {
+  const checkArgs = [
+    '-f', formatSelector,
+    '--get-url',
+    '--no-playlist',
+    '--no-warnings',
+    '--no-check-certificates',
+    '--socket-timeout', '15',
+    url,
+  ];
+
+  const tryCombo = (playerClients, useCookies) =>
+    new Promise((resolve, reject) => {
+      execFile(
+        YTDLP_PATH,
+        withCookies(checkArgs, playerClients, useCookies),
+        { timeout: 20_000, maxBuffer: 2 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err || !stdout?.trim()) {
+            const full = stderr?.toString().trim();
+            console.error(
+              `[resolveWorkingCombo] failed (client=${playerClients}, cookies=${useCookies}):\n${full || err?.message}`
+            );
+            return reject(new Error(full?.split('\n').filter(Boolean).pop() || err?.message || 'No URL resolved'));
+          }
+          resolve({ playerClients, useCookies });
+        }
+      );
+    });
+
+  return (async () => {
+    let lastErr;
+    const cookiePasses = COOKIES_FILE_PATH ? [true, false] : [false];
+    for (const useCookies of cookiePasses) {
+      for (const clients of CLIENT_FALLBACKS) {
+        try {
+          return await tryCombo(clients, useCookies);
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+    }
+    throw lastErr;
+  })();
+}
+
+// ---------------------------------------------------------------------
 // GET /api/download
 // query: url, formatId (optional), type=video|audio (default video)
 // Streams the file straight through to the client - nothing is written
 // to disk on the server.
 // ---------------------------------------------------------------------
-app.get('/api/download', downloadLimiter, (req, res) => {
+app.get('/api/download', downloadLimiter, async (req, res) => {
   const { url, formatId, type = 'video', filename } = req.query;
 
   if (!url || typeof url !== 'string' || !isSupportedUrl(url)) {
@@ -402,12 +460,23 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     procs.forEach((p) => p && !p.killed && p.kill('SIGKILL'));
   };
 
+  const capSelector = `bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`;
+  const audioSelector = formatId ? `${formatId}/bestaudio/best` : 'bestaudio/best';
+  const videoSelector = formatId ? `${formatId}/${capSelector}` : capSelector;
+  const selector = type === 'audio' ? audioSelector : videoSelector;
+
+  let combo;
+  try {
+    combo = await resolveWorkingCombo(url, selector);
+  } catch (err) {
+    return res.status(502).json({
+      error: 'Download failed. Could not resolve this format under any client/cookie combination.',
+      detail: err.message,
+    });
+  }
+
   if (type === 'audio') {
     // yt-dlp -> stdout (best audio track) piped into ffmpeg -> mp3 -> stdout
-    // If a specific formatId was requested but is no longer resolvable
-    // (YouTube's available itags can shift between /api/info and the
-    // actual download), fall back to bestaudio instead of hard-failing.
-    const audioSelector = formatId ? `${formatId}/bestaudio/best` : 'bestaudio/best';
     const ytArgs = [
       '-f', audioSelector,
       '-o', '-',
@@ -418,7 +487,7 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     ];
     const ffArgs = ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-acodec', 'libmp3lame', '-q:a', '2', '-f', 'mp3', 'pipe:1'];
 
-    const yt = spawn(YTDLP_PATH, withCookies(ytArgs));
+    const yt = spawn(YTDLP_PATH, withCookies(ytArgs, combo.playerClients, combo.useCookies));
     const ff = spawn(FFMPEG_PATH, ffArgs);
 
     res.setHeader('Content-Type', 'audio/mpeg');
@@ -451,10 +520,6 @@ app.get('/api/download', downloadLimiter, (req, res) => {
     //     instead of seeking back, so it works perfectly over a pipe -
     //     the resulting file is still a completely standard, fully
     //     playable mp4 once downloaded.
-    // Same fallback idea as the audio branch: try the exact requested
-    // format first, then drop back to a safe <=1080p pick if it's gone.
-    const capSelector = `bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`;
-    const videoSelector = formatId ? `${formatId}/${capSelector}` : capSelector;
     const ytArgs = [
       '-f', videoSelector,
       '--merge-output-format', 'mp4',
@@ -467,7 +532,7 @@ app.get('/api/download', downloadLimiter, (req, res) => {
       url,
     ];
 
-    const yt = spawn(YTDLP_PATH, withCookies(ytArgs));
+    const yt = spawn(YTDLP_PATH, withCookies(ytArgs, combo.playerClients, combo.useCookies));
     let stderrTail = '';
 
     res.setHeader('Content-Type', 'video/mp4');
