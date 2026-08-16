@@ -1,22 +1,22 @@
 FROM node:20-slim
 
-# ffmpeg (for merging video+audio and mp3 conversion), python3/pip (to
-# install yt-dlp), and Deno (a JavaScript runtime yt-dlp now needs to
-# solve the "signature"/"n" challenges YouTube throws at every request -
-# without it, YouTube serves formats with no usable download URL at all,
-# which is why extraction was failing with "Requested format is not
-# available" even though everything else was configured correctly).
-# ARG CACHEBUST forces this layer to always rerun on every build, instead of
-# reusing Docker's cached layer from the first-ever build. Without this,
-# "pip3 install -U yt-dlp" only actually updates once - on every deploy
-# after that, Docker sees this line hasn't changed and just reuses the
-# OLD cached yt-dlp version, silently defeating the -U flag. YouTube's
-# bot-detection changes fast enough that this matters a lot.
-ARG CACHEBUST=1
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg python3-pip ca-certificates curl unzip && \
+# ffmpeg (for merging video+audio and mp3 conversion) + python3/pip (to install yt-dlp)
+# We key the cache-bust off Railway's auto-injected git commit SHA instead of
+# a static number. A hardcoded ARG value (e.g. CACHEBUST=1) never changes
+# between builds, so Docker just reuses the very first cached layer forever -
+# "pip3 install -U yt-dlp" then only ever actually runs ONCE, on the
+# first-ever build, silently going stale on every deploy after that even
+# though the command looks like it updates. Since RAILWAY_GIT_COMMIT_SHA is
+# different on every push, referencing it inside the RUN command forces a
+# real cache miss (and therefore a real yt-dlp update) on every deploy.
+# YouTube's bot-detection/page-structure changes fast enough that this
+# matters a lot - see the "Failed to extract any player response... update
+# yt-dlp" error class, which is yt-dlp's own way of reporting it's stale.
+ARG RAILWAY_GIT_COMMIT_SHA=unknown
+RUN echo "cachebust: ${RAILWAY_GIT_COMMIT_SHA}" && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg python3-pip ca-certificates && \
     pip3 install --no-cache-dir --break-system-packages -U yt-dlp && \
-    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
