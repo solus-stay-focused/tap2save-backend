@@ -91,13 +91,19 @@ function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
   // serves them fine. Without this flag only the legacy pre-muxed 360p
   // stream (itag 18, the one format that's never required a PO token)
   // shows up, which is why only one quality was appearing.
-  const extra = [
-    '--no-cache-dir', // avoids yt-dlp replaying a stale cached failure/format
-                       // result for a video ID it tried earlier under
-                       // different auth/client conditions
-    '--extractor-args',
-    `youtube:player_client=${playerClients};formats=missing_pot`,
-  ];
+  //
+  // playerClients === null means "plain mode": skip the client/PO-token
+  // override entirely and let yt-dlp pick its own defaults. Some videos
+  // only expose PO-token-gated formats that our cookies can't satisfy -
+  // forcing formats=missing_pot on those returns zero usable formats no
+  // matter which client we force. Plain mode is the final fallback.
+  const extra = ['--no-cache-dir']; // avoids yt-dlp replaying a stale cached
+                                     // failure/format result for a video ID
+                                     // it tried earlier under different
+                                     // auth/client conditions
+  if (playerClients !== null) {
+    extra.push('--extractor-args', `youtube:player_client=${playerClients};formats=missing_pot`);
+  }
   const withClient = [...extra, ...args];
   return COOKIES_FILE_PATH ? ['--cookies', COOKIES_FILE_PATH, ...withClient] : withClient;
 }
@@ -105,13 +111,15 @@ function withCookies(args, playerClients = CLIENT_FALLBACKS[0]) {
 // Different player-client combos succeed/fail on a per-video basis
 // (age-restricted, members-only, or livestream/premiere content in
 // particular can reject one combo but work fine with another). Try the
-// normal combo first, then fall back to progressively different ones
-// instead of failing the whole request after a single attempt.
+// normal combo first, then fall back to progressively different ones,
+// and finally try plain mode (null = no client/PO-token override at
+// all) before giving up entirely.
 const CLIENT_FALLBACKS = [
   'android,tv,web',
   'tv,web',
   'web',
   'ios',
+  null,
 ];
 
 app.use(express.json({ limit: '32kb' }));
