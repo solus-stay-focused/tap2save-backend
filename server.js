@@ -117,18 +117,23 @@ function withCookies(args, playerClients = CLIENT_FALLBACKS[0], useCookies = tru
 
 // Different player-client combos succeed/fail on a per-video basis
 // (age-restricted, members-only, or livestream/premiere content in
-// particular can reject one combo but work fine with another). Try the
-// normal combo first, then fall back to progressively different ones,
-// and finally try plain mode (null = no client/PO-token override at
-// all) before giving up entirely. Each entry also gets tried once WITH
-// cookies and, if that fails, once WITHOUT - see CLIENT_FALLBACKS usage
-// in fetchMetadata().
+// particular can reject one combo but work fine with another).
+//
+// IMPORTANT: forcing multiple clients at once (e.g. "android,tv,web")
+// means yt-dlp fetches a separate player response for EACH of those
+// clients before it can build the format list - that's 2-3x slower
+// than a single client, every single time, even when it wasn't needed.
+// Now that cookies are fresh and valid, a single client is enough for
+// almost every video, so we try the cheapest single-client option
+// FIRST and only reach for the slower multi-client combos as a
+// fallback for videos that actually need them.
 const CLIENT_FALLBACKS = [
-  'android,tv,web',
+  'web',             // fastest: 1 client, works great with valid cookies
+  'android',         // fast fallback, well-supported
+  'android,tv,web',  // broader combo for stubborn videos
   'tv,web',
-  'web',
   'ios',
-  null,
+  null,              // plain mode - no client/PO-token override at all
 ];
 
 app.use(express.json({ limit: '32kb' }));
