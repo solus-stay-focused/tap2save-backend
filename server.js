@@ -49,8 +49,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
   .split(',')
   .map((s) => s.trim());
 
-// Only offer/allow qualities at or below 1080p (no 1440p/4K etc).
-const MAX_VIDEO_HEIGHT = 1080;
+// Only offer/allow qualities at or below 720p (no 1080p/1440p/4K etc).
+const MAX_VIDEO_HEIGHT = 720;
 
 // ---------------------------------------------------------------------
 // YouTube cookies (fixes "Sign in to confirm you're not a bot")
@@ -267,7 +267,7 @@ function simplifyFormats(rawFormats = []) {
     if (hasVideo) {
       const height = f.height || 0;
       if (!height) continue; // skip formats with no usable resolution info
-      if (height > MAX_VIDEO_HEIGHT) continue; // cap: never offer above 1080p
+      if (height > MAX_VIDEO_HEIGHT) continue; // cap: never offer above 720p
 
       // Prefer higher bitrate, higher fps, and widely-compatible h264/avc1
       const score =
@@ -378,61 +378,64 @@ app.post('/api/info', infoLimiter, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// Helper: find a client/cookie combo that can actually resolve a given
-// format selector for this URL, using `--get-url` (fast - just resolves
-// the direct media URL, doesn't download it). This is what fixes the
-// "0 bytes downloaded" bug: /api/info can succeed under one combo (e.g.
-// no cookies + ios client) while /api/download was hardcoded to always
-// use a different combo (cookies + android,tv,web) that doesn't resolve
-// this particular video - yt-dlp then exits with no output, and the
-// browser silently saves an empty file. Running this cheap check first
-// means the real (slow) download always uses a combo we've confirmed
-// actually works.
+// Helper: run a chain of already-piped child processes (e.g. yt-dlp ->
+// ffmpeg) and resolve as soon as the LAST one in the chain produces its
+// first real byte of output. If any process in the chain exits with a
+// non-zero code before that happens, the whole chain is treated as
+// failed (so the caller can try a different client/cookie combo)
+// instead of streaming a broken/empty response to the browser.
+//
+// This replaces an earlier version that ran a full separate `--get-url`
+// pre-check before every real download - that worked, but doubled
+// yt-dlp's extraction cost (which is the slow part) on EVERY download,
+// even ones that would have succeeded on the very first try. This
+// version only pays that extra cost on the rare video that actually
+// needs a fallback combo.
 // ---------------------------------------------------------------------
-function resolveWorkingCombo(url, formatSelector) {
-  const checkArgs = [
-    '-f', formatSelector,
-    '--get-url',
-    '--no-playlist',
-    '--no-warnings',
-    '--no-check-certificates',
-    '--socket-timeout', '15',
-    url,
-  ];
+function runChainAndWaitForFirstByte(procs, { timeoutMs = 25_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const last = procs[procs.length - 1];
+    const stderrTails = procs.map(() => '');
+    let timer;
 
-  const tryCombo = (playerClients, useCookies) =>
-    new Promise((resolve, reject) => {
-      execFile(
-        YTDLP_PATH,
-        withCookies(checkArgs, playerClients, useCookies),
-        { timeout: 20_000, maxBuffer: 2 * 1024 * 1024 },
-        (err, stdout, stderr) => {
-          if (err || !stdout?.trim()) {
-            const full = stderr?.toString().trim();
-            console.error(
-              `[resolveWorkingCombo] failed (client=${playerClients}, cookies=${useCookies}):\n${full || err?.message}`
-            );
-            return reject(new Error(full?.split('\n').filter(Boolean).pop() || err?.message || 'No URL resolved'));
-          }
-          resolve({ playerClients, useCookies });
+    const finish = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      last.stdout.removeListener('data', onData);
+      fn();
+    };
+
+    procs.forEach((p, i) => {
+      p.stderr?.on('data', (d) => {
+        const s = d.toString();
+        stderrTails[i] = (stderrTails[i] + s).slice(-4000);
+      });
+      p.on('error', (err) => finish(() => reject(err)));
+      p.on('exit', (code) => {
+        if (code !== 0) {
+          finish(() =>
+            reject(
+              new Error(
+                stderrTails[i].split('\n').filter(Boolean).pop() || `process exited with code ${code}`
+              )
+            )
+          );
         }
-      );
+      });
     });
 
-  return (async () => {
-    let lastErr;
-    const cookiePasses = COOKIES_FILE_PATH ? [true, false] : [false];
-    for (const useCookies of cookiePasses) {
-      for (const clients of CLIENT_FALLBACKS) {
-        try {
-          return await tryCombo(clients, useCookies);
-        } catch (err) {
-          lastErr = err;
-        }
-      }
-    }
-    throw lastErr;
-  })();
+    const onData = (chunk) => finish(() => resolve({ firstChunk: chunk }));
+    last.stdout.on('data', onData);
+
+    timer = setTimeout(() => {
+      finish(() => {
+        procs.forEach((p) => !p.killed && p.kill('SIGKILL'));
+        reject(new Error('Timed out waiting for data'));
+      });
+    }, timeoutMs);
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -453,30 +456,27 @@ app.get('/api/download', downloadLimiter, async (req, res) => {
     .replace(/[^a-zA-Z0-9_\-. ]/g, '_')
     .slice(0, 120);
 
+  // Only offer/allow up to 720p in the video quality ladder. If a
+  // formatId was requested but is no longer resolvable, fall back to a
+  // safe <=720p pick instead of hard-failing.
+  const capSelector = `bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`;
+  const audioSelector = formatId ? `${formatId}/bestaudio/best` : 'bestaudio/best';
+  const videoSelector = formatId ? `${formatId}/${capSelector}` : capSelector;
+
+  const cookiePasses = COOKIES_FILE_PATH ? [true, false] : [false];
+  const combos = cookiePasses.flatMap((useCookies) =>
+    CLIENT_FALLBACKS.map((clients) => ({ clients, useCookies }))
+  );
+
   let killed = false;
   const cleanup = (...procs) => {
     if (killed) return;
     killed = true;
     procs.forEach((p) => p && !p.killed && p.kill('SIGKILL'));
   };
+  req.on('close', () => cleanup());
 
-  const capSelector = `bv*[height<=${MAX_VIDEO_HEIGHT}]+ba/b[height<=${MAX_VIDEO_HEIGHT}]`;
-  const audioSelector = formatId ? `${formatId}/bestaudio/best` : 'bestaudio/best';
-  const videoSelector = formatId ? `${formatId}/${capSelector}` : capSelector;
-  const selector = type === 'audio' ? audioSelector : videoSelector;
-
-  let combo;
-  try {
-    combo = await resolveWorkingCombo(url, selector);
-  } catch (err) {
-    return res.status(502).json({
-      error: 'Download failed. Could not resolve this format under any client/cookie combination.',
-      detail: err.message,
-    });
-  }
-
-  if (type === 'audio') {
-    // yt-dlp -> stdout (best audio track) piped into ffmpeg -> mp3 -> stdout
+  const attemptAudio = async (clients, useCookies) => {
     const ytArgs = [
       '-f', audioSelector,
       '-o', '-',
@@ -486,27 +486,14 @@ app.get('/api/download', downloadLimiter, async (req, res) => {
       url,
     ];
     const ffArgs = ['-loglevel', 'error', '-i', 'pipe:0', '-vn', '-acodec', 'libmp3lame', '-q:a', '2', '-f', 'mp3', 'pipe:1'];
-
-    const yt = spawn(YTDLP_PATH, withCookies(ytArgs, combo.playerClients, combo.useCookies));
+    const yt = spawn(YTDLP_PATH, withCookies(ytArgs, clients, useCookies));
     const ff = spawn(FFMPEG_PATH, ffArgs);
-
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp3"`);
-
     yt.stdout.pipe(ff.stdin);
-    ff.stdout.pipe(res);
+    const { firstChunk } = await runChainAndWaitForFirstByte([yt, ff]);
+    return { procs: [yt, ff], finalStream: ff.stdout, firstChunk };
+  };
 
-    yt.stderr.on('data', (d) => console.error('[yt-dlp]', d.toString()));
-    ff.stderr.on('data', (d) => console.error('[ffmpeg]', d.toString()));
-
-    yt.on('error', () => { cleanup(yt, ff); if (!res.headersSent) res.sendStatus(500); });
-    ff.on('error', () => { cleanup(yt, ff); if (!res.headersSent) res.sendStatus(500); });
-    req.on('close', () => cleanup(yt, ff));
-  } else {
-    // Video: yt-dlp downloads video+audio, merges them with ffmpeg, and
-    // streams the result straight to the browser as it's produced - no
-    // waiting for a full file to finish writing to disk first.
-    //
+  const attemptVideo = async (clients, useCookies) => {
     // Two things had to be true at once to make this safe:
     //  1. Audio must always be AAC (not copied as-is), because YouTube's
     //     separate audio track is usually Opus, and most standard video
@@ -531,32 +518,50 @@ app.get('/api/download', downloadLimiter, async (req, res) => {
       '--no-check-certificates',
       url,
     ];
+    const yt = spawn(YTDLP_PATH, withCookies(ytArgs, clients, useCookies));
+    const { firstChunk } = await runChainAndWaitForFirstByte([yt]);
+    return { procs: [yt], finalStream: yt.stdout, firstChunk };
+  };
 
-    const yt = spawn(YTDLP_PATH, withCookies(ytArgs, combo.playerClients, combo.useCookies));
-    let stderrTail = '';
+  const attempt = type === 'audio' ? attemptAudio : attemptVideo;
 
+  let result;
+  let lastErr;
+  for (const { clients, useCookies } of combos) {
+    try {
+      result = await attempt(clients, useCookies);
+      break;
+    } catch (err) {
+      lastErr = err;
+      console.error(`[download] combo failed (client=${clients}, cookies=${useCookies}): ${err.message}`);
+    }
+  }
+
+  if (!result) {
+    return res.status(502).json({
+      error: 'Download failed under every client/cookie combination.',
+      detail: lastErr?.message,
+    });
+  }
+
+  if (killed) {
+    // Client disconnected while we were still trying combos.
+    result.procs.forEach((p) => !p.killed && p.kill('SIGKILL'));
+    return;
+  }
+
+  if (type === 'audio') {
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp3"`);
+  } else {
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp4"`);
-
-    yt.stdout.pipe(res);
-    yt.stderr.on('data', (d) => {
-      const s = d.toString();
-      stderrTail = (stderrTail + s).slice(-4000);
-      console.error('[yt-dlp]', s);
-    });
-    yt.on('error', (err) => {
-      cleanup(yt);
-      if (!res.headersSent) res.status(500).json({ error: 'Failed to start yt-dlp.', detail: err.message });
-    });
-    yt.on('exit', (code) => {
-      if (killed) return;
-      if (code !== 0 && !res.headersSent) {
-        const msg = stderrTail.split('\n').filter(Boolean).pop() || 'yt-dlp exited with an error.';
-        res.status(502).json({ error: 'Download failed.', detail: msg });
-      }
-    });
-    req.on('close', () => cleanup(yt));
   }
+
+  res.write(result.firstChunk);
+  result.finalStream.pipe(res);
+  result.finalStream.on('error', () => cleanup(...result.procs));
+  req.on('close', () => cleanup(...result.procs));
 });
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
